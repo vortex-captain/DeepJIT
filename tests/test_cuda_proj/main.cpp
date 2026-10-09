@@ -23,7 +23,11 @@
 
 #include <cuda_runtime.h>
 #include <pybind11/pybind11.h>
+#if defined(_WIN32)
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <deep_jit/backend/cuda/backend.hpp>
 #include <deep_jit/backend/cuda/stable_torch_utils.h>
@@ -103,11 +107,19 @@ void expect_any_failure(Function&& function) {
 }
 
 void set_env(const std::string& name, const std::string& value) {
+#if defined(_WIN32)
+    DJ_HOST_ASSERT(::_putenv_s(name.c_str(), value.c_str()) == 0, "failed to set environment variable: {}", name);
+#else
     DJ_HOST_ASSERT(::setenv(name.c_str(), value.c_str(), 1) == 0, "failed to set environment variable: {}", name);
+#endif
 }
 
 void unset_env(const std::string& name) {
+#if defined(_WIN32)
+    DJ_HOST_ASSERT(::_putenv_s(name.c_str(), "") == 0, "failed to unset environment variable: {}", name);
+#else
     DJ_HOST_ASSERT(::unsetenv(name.c_str()) == 0, "failed to unset environment variable: {}", name);
+#endif
 }
 
 std::optional<std::string> get_raw_env(const std::string& name) {
@@ -402,7 +414,11 @@ void test_command_and_uuid() {
                    "command failed with exit code 7");
     expect_failure([] { deep_jit::call_external_command("kill -TERM $$"); }, "exit code 143");
 
+#if defined(_WIN32)
+    const auto prefix = std::to_string(::_getpid()) + "-";
+#else
     const auto prefix = std::to_string(::getpid()) + "-";
+#endif
     for (int i = 0; i < 16; ++i) {
         const auto uuid = deep_jit::get_uuid();
         DJ_HOST_ASSERT(uuid.starts_with(prefix), "UUID does not contain the process id: {}", uuid);

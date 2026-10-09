@@ -1,5 +1,6 @@
 import json
 import os
+import platform
 import signal
 import shlex
 import subprocess
@@ -9,10 +10,16 @@ import tempfile
 import threading
 import time
 from collections import Counter
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
-from torch.utils.cpp_extension import CUDA_HOME, load
+from torch.utils.cpp_extension import (
+    COMMON_MSVC_FLAGS,
+    CUDA_HOME,
+    get_default_build_root,
+    load,
+)
 
 
 if not __debug__:
@@ -201,6 +208,23 @@ assert not torch.cuda.is_initialized()
         assert (fork_cache / 'cache').is_dir(), 'forked children did not compile through the lazy runtime'
 
 
+def windows_cxx_flags():
+    torch_include = Path(torch.__file__).resolve().parent / 'include'
+    external_includes = [
+        torch_include,
+        torch_include / 'torch' / 'csrc' / 'api' / 'include',
+        Path(sysconfig.get_paths()['include']),
+        Path(CUDA_HOME) / 'include',
+    ]
+    return [
+        '/std:c++20', '/O2', '/W4', '/WX', '/EHsc', '/MD',
+        '/permissive-', '/utf-8', '/DNOMINMAX', '/Zc:preprocessor',
+        '/DTORCH_TARGET_VERSION=0x020a000000000000', '/DUSE_CUDA',
+        '/wd4996', '/external:W0',
+        *[f'/external:I{path}' for path in external_includes],
+    ]
+
+
 def validate_header_self_containment(temporary_dir):
     assert CUDA_HOME is not None
     include_root = ROOT / 'include'
@@ -220,15 +244,22 @@ def validate_header_self_containment(temporary_dir):
     source_path = temporary_dir / 'header_self_containment.cpp'
     for header in headers:
         source_path.write_text(f'#include <{header.as_posix()}>\n', encoding='utf-8')
-        command = [
-            os.environ.get('CXX', 'c++'), '-std=c++20', '-fsyntax-only', '-Werror',
-            '-DTORCH_TARGET_VERSION=0x020a000000000000', '-DUSE_CUDA',
-            '-Wno-attributes', '-Wno-deprecated-declarations',
-            '-Wno-missing-field-initializers', '-Wno-psabi',
-            str(source_path),
-        ]
-        for include_path in include_paths:
-            command.extend(['-isystem', str(include_path)])
+        if sys.platform == 'win32':
+            command = [
+                os.environ.get('CXX', 'cl'), '/nologo', '/Zs',
+                *COMMON_MSVC_FLAGS, *windows_cxx_flags(),
+                '/I', str(include_root), str(source_path),
+            ]
+        else:
+            command = [
+                os.environ.get('CXX', 'c++'), '-std=c++20', '-fsyntax-only', '-Werror',
+                '-DTORCH_TARGET_VERSION=0x020a000000000000', '-DUSE_CUDA',
+                '-Wno-attributes', '-Wno-deprecated-declarations',
+                '-Wno-missing-field-initializers', '-Wno-psabi',
+                str(source_path),
+            ]
+            for include_path in include_paths:
+                command.extend(['-isystem', str(include_path)])
         result = subprocess.run(command, capture_output=True, text=True, timeout=60)
         assert result.returncode == 0, f'{header}:\n{result.stdout}{result.stderr}'
     print(f'validated {len(headers)} self-contained CUDA/public headers', flush=True)
@@ -757,14 +788,25 @@ def validate_artifacts(cache_root):
 def run_worker():
     clear_external_jit_environment()
     temporary_parent = os.environ.get('DEEP_JIT_TEST_TMPDIR')
+    if sys.platform == 'win32':
+        # A loaded .pyd cannot be deleted until the Python process exits.
+        build_root = Path(
+            os.environ.get('TORCH_EXTENSIONS_DIR', get_default_build_root()))
+        build_context = nullcontext(build_root / 'deep_jit_cuda_test')
+    else:
+        build_context = tempfile.TemporaryDirectory(prefix='deep-jit-build-')
     with tempfile.TemporaryDirectory(prefix='deep-jit-test-', dir=temporary_parent) as temporary_dir, \
-            tempfile.TemporaryDirectory(prefix='deep-jit-build-') as build_dir:
+            build_context as build_dir:
         temporary_dir = Path(temporary_dir)
         build_dir = Path(build_dir)
+        build_dir.mkdir(parents=True, exist_ok=True)
         cache_root = temporary_dir / 'cache'
         bin_dir = temporary_dir / 'bin'
         bin_dir.mkdir()
-        (bin_dir / 'python').symlink_to(sys.executable)
+        if sys.platform == 'win32':
+            bin_dir = Path(sys.executable).parent
+        else:
+            (bin_dir / 'python').symlink_to(sys.executable)
 
         os.environ['PATH'] = str(bin_dir) + os.pathsep + os.environ.get('PATH', '')
         os.environ['DEEP_JIT_CUDA_TEST_SOURCE_DIR'] = str(TEST_CUDA_PROJECT)
@@ -783,17 +825,24 @@ def run_worker():
         os.environ['TEST_JIT_PRINT_LOAD_TIME'] = '0'
         os.environ['TEST_JIT_CPP_STANDARD'] = '20'
 
+        if sys.platform == 'win32':
+            cuda_arch = (
+                'arm64' if platform.machine().lower() in ('arm64', 'aarch64')
+                else 'x64')
+            ldflags = [f'/LIBPATH:{Path(CUDA_HOME) / "lib" / cuda_arch}']
+        else:
+            ldflags = ['-ldl']
         module = load(
             name='deep_jit_cuda_test',
             sources=[str(TEST_CUDA_PROJECT / 'main.cpp')],
-            extra_cflags=[
+            extra_cflags=windows_cxx_flags() if sys.platform == 'win32' else [
                 '-std=c++20', '-O3', '-fPIC', '-Wall', '-Wextra', '-Werror',
                 '-DTORCH_TARGET_VERSION=0x020a000000000000', '-DUSE_CUDA',
                 '-Wno-attributes', '-Wno-missing-field-initializers',
                 '-Wno-psabi', '-Wno-deprecated-declarations',
             ],
             extra_include_paths=[str(ROOT / 'include')],
-            extra_ldflags=['-ldl'],
+            extra_ldflags=ldflags,
             build_directory=str(build_dir),
             with_cuda=True,
             verbose=True,

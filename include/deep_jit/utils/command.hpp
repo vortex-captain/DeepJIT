@@ -4,7 +4,9 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#if !defined(_WIN32)
 #include <sys/wait.h>
+#endif
 
 #include <deep_jit/utils/exception.hpp>
 
@@ -16,11 +18,22 @@ inline std::string call_external_command(std::string command, const bool print_c
         std::printf("Running command: %s\n", command.c_str());
 
     command += " 2>&1";
+#if defined(_WIN32)
+    command = "\"" + command + "\"";
+#endif
     const auto deleter = [](FILE* file) {
         if (file != nullptr)
+#if defined(_WIN32)
+            _pclose(file);
+#else
             pclose(file);
+#endif
     };
+#if defined(_WIN32)
+    std::unique_ptr<FILE, decltype(deleter)> pipe(_popen(command.c_str(), "r"), deleter);
+#else
     std::unique_ptr<FILE, decltype(deleter)> pipe(popen(command.c_str(), "r"), deleter);
+#endif
     DJ_HOST_ASSERT(pipe != nullptr, "failed to run command: {}", command);
 
     std::array<char, 512> buffer;
@@ -28,10 +41,14 @@ inline std::string call_external_command(std::string command, const bool print_c
     while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr)
         output += buffer.data();
 
+#if defined(_WIN32)
+    const auto exit_code = _pclose(pipe.release());
+#else
     // NOTES: if the child was killed by a signal (e.g., SIGINT from Ctrl+C),
     // WEXITSTATUS would incorrectly return 0. Treat signal death as failure.
     const auto status = pclose(pipe.release());
     const auto exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+#endif
     DJ_HOST_ASSERT(exit_code == 0, "command failed with exit code {}:\n{}\n{}", exit_code, command, output);
     return output;
 }

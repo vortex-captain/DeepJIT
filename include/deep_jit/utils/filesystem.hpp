@@ -9,7 +9,12 @@
 #include <string_view>
 #include <system_error>
 #include <fcntl.h>
+#if defined(_WIN32)
+#include <io.h>
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <deep_jit/utils/exception.hpp>
 
@@ -22,6 +27,24 @@ inline std::string read(const std::filesystem::path& path) {
 }
 
 inline void fsync_file(const std::filesystem::path& path) {
+#if defined(_WIN32)
+    const auto handle = ::CreateFileW(
+        path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        const std::error_code error(::GetLastError(), std::system_category());
+        DJ_PANIC("failed to open for fsync: {}: {}", path.string(), error.message());
+    }
+    if (not ::FlushFileBuffers(handle)) {
+        const std::error_code error(::GetLastError(), std::system_category());
+        ::CloseHandle(handle);
+        DJ_PANIC("failed to fsync: {}: {}", path.string(), error.message());
+    }
+    if (not ::CloseHandle(handle)) {
+        const std::error_code error(::GetLastError(), std::system_category());
+        DJ_PANIC("failed to close after fsync: {}: {}", path.string(), error.message());
+    }
+#else
     const auto fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         const std::error_code error(errno, std::generic_category());
@@ -36,6 +59,7 @@ inline void fsync_file(const std::filesystem::path& path) {
         const std::error_code error(errno, std::generic_category());
         DJ_PANIC("failed to close after fsync: {}: {}", path.string(), error.message());
     }
+#endif
 }
 
 // Recursively fsync a directory tree, bottom-up: ensures data and directory
@@ -114,7 +138,12 @@ inline std::optional<std::filesystem::path> normalize_path(const std::optional<s
 }
 
 inline bool is_executable(const std::filesystem::path& path) {
+#if defined(_WIN32)
+    // Simplified check: 4 requests CRT read access, not execute permission or ACLs.
+    return std::filesystem::is_regular_file(path) and ::_waccess(path.c_str(), 4) == 0;
+#else
     return std::filesystem::is_regular_file(path) and ::access(path.c_str(), X_OK) == 0;
+#endif
 }
 
 }  // namespace deep_jit

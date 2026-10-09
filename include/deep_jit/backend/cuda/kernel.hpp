@@ -64,8 +64,13 @@ public:
         // Load kernel
         CUlibrary library_handle{};
         CUfunction kernel_handle{};
+#if defined(_WIN32)
+        DJ_CUDA_DRIVER_CHECK(driver::lazy_cuLibraryLoadFromFile(
+            &library_handle, cubin_path.string().c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+#else
         DJ_CUDA_DRIVER_CHECK(driver::lazy_cuLibraryLoadFromFile(
             &library_handle, cubin_path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+#endif
         try {
             unsigned int num_kernels = 0;
             DJ_CUDA_DRIVER_CHECK(driver::lazy_cuLibraryGetKernelCount(&num_kernels, library_handle));

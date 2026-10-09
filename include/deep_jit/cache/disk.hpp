@@ -85,13 +85,17 @@ struct DiskCache {
     }
 
     static DiskCache from_env(const Env& env) {
-        // Parse PATH_1:PATH_2:PATH_3 into a writable cache root followed by
+        // Parse a platform-separated list into a writable cache root followed by
         // zero or more read-only lookup roots.
         std::vector<std::filesystem::path> paths;
         if (const auto env_opt = env.get<std::string>("JIT_CACHE_DIR")) {
             size_t begin = 0;
             while (true) {
+#if defined(_WIN32)
+                const auto end = env_opt->find(';', begin);
+#else
                 const auto end = env_opt->find(':', begin);
+#endif
                 const auto item = env_opt->substr(begin, end - begin);
                 DJ_HOST_ASSERT(not item.empty(), "disk cache path list contains an empty path: {}", env_opt.value());
                 paths.emplace_back(item);
@@ -100,7 +104,11 @@ struct DiskCache {
                 begin = end + 1;
             }
         } else {
-            const auto home = get_env<std::string>("HOME");
+            auto home = get_env<std::string>("HOME");
+#if defined(_WIN32)
+            if (home.empty())
+                home = get_env<std::string>("USERPROFILE");
+#endif
             DJ_HOST_ASSERT(not home.empty(), "HOME environment variable must not be empty");
             paths.emplace_back(std::filesystem::path(home) / ".dj");
         }

@@ -60,8 +60,16 @@ public:
         : toolkit(find_cuda_toolkit(env)),
           compiler_info(get_compiler_info()) {}
 
+    static std::string command_path(const std::filesystem::path& path) {
+#if defined(_WIN32)
+        return "\"" + path.string() + "\"";
+#else
+        return path.string();
+#endif
+    }
+
     [[nodiscard]] CompilerInfo get_compiler_info() const {
-        const auto version = call_external_command(toolkit.nvcc.string() + " --version");
+        const auto version = call_external_command(command_path(toolkit.nvcc) + " --version");
 
         // Should support arch-family
         std::smatch match;
@@ -94,22 +102,26 @@ public:
 
         // Build the full command
         std::vector<std::string> args = {
-            toolkit.nvcc.string(),
-            source_path.string(),
+            command_path(toolkit.nvcc),
+            command_path(source_path),
             "--cubin",
             "--output-file",
-            cubin_path.string(),
+            command_path(cubin_path),
         };
         const auto option_flags = options.get_flags();
         args.insert(args.end(), option_flags.begin(), option_flags.end());
         for (const auto& include_dir: config.include_dirs) {
             args.emplace_back("--include-path");
-            args.emplace_back(include_dir.string());
+            args.emplace_back(command_path(include_dir));
         }
         const auto command = str::join(args);
 
         // NOTES: change directory into a temporary empty directory to prevent same name include files
+#if defined(_WIN32)
+        const auto cd_command = "cd /D " + command_path(dir) + " && ";
+#else
         const auto cd_command = "cd " + dir.string() + " && ";
+#endif
 
         // Compile
         const auto compiler_output = call_external_command(cd_command + command, print_compiler_command);
@@ -132,8 +144,8 @@ public:
         // Run post hook
         if (options.post_hook) {
             const auto hook_path = config.get_python_path(*options.post_hook);
-            const auto hook_command = "cd " + dir.string() +
-                                      " && python " + hook_path.string() + " " + cubin_path.string();
+            const auto hook_command = cd_command +
+                                      "python " + command_path(hook_path) + " " + command_path(cubin_path);
             call_external_command(hook_command, print_compiler_command);
         }
 
@@ -141,7 +153,7 @@ public:
         if (options.dump_ptx.value_or(false)) {
             const auto ptx_path = dir / "kernel.ptx";
             auto ptx_args = args;
-            ptx_args[2] = "--ptx", ptx_args[4] = ptx_path.string();
+            ptx_args[2] = "--ptx", ptx_args[4] = command_path(ptx_path);
             call_external_command(cd_command + str::join(ptx_args), print_compiler_command);
             DJ_HOST_ASSERT(std::filesystem::is_regular_file(ptx_path) and std::filesystem::file_size(ptx_path) != 0,
                            "NVCC did not produce a valid PTX: {}", ptx_path.string());
@@ -151,7 +163,7 @@ public:
         if (options.dump_sass.value_or(false)) {
             DJ_HOST_ASSERT(toolkit.cuobjdump.has_value());
             const auto sass_path = dir / "kernel.sass";
-            const auto sass_command = toolkit.cuobjdump->string() + " --dump-sass " + cubin_path.string();
+            const auto sass_command = command_path(*toolkit.cuobjdump) + " --dump-sass " + command_path(cubin_path);
             const auto sass = call_external_command(cd_command + sass_command, print_compiler_command);
             DJ_HOST_ASSERT(not sass.empty(), "cuobjdump did not produce valid SASS for {}", cubin_path.string());
             write_file_sync(sass_path, sass);
@@ -184,7 +196,13 @@ public:
         // 2. `which nvcc`
         if (home_path.empty()) {
             try {
+#if defined(_WIN32)
+                auto path = call_external_command("where.exe nvcc.exe");
+                if (const auto end = path.find_first_of("\r\n"); end != std::string::npos)
+                    path.resize(end);
+#else
                 auto path = call_external_command("which nvcc");
+#endif
                 while (not path.empty() and (path.back() == '\r' or path.back() == '\n'))
                     path.pop_back();
                 if (not path.empty())
@@ -205,12 +223,20 @@ public:
         if (const auto path = env.get<std::string>("JIT_NVCC_COMPILER"); path and not path->empty()) {
             nvcc = std::filesystem::absolute(*path).lexically_normal();
         } else {
+#if defined(_WIN32)
+            nvcc = home_path / "bin" / "nvcc.exe";
+#else
             nvcc = home_path / "bin/nvcc";
+#endif
         }
         DJ_HOST_ASSERT(is_executable(nvcc), "NVCC compiler is not executable: {}", nvcc.string());
 
         // Try to find `cuobjdump`
+#if defined(_WIN32)
+        const auto cuobjdump_path = home_path / "bin" / "cuobjdump.exe";
+#else
         const auto cuobjdump_path = home_path / "bin/cuobjdump";
+#endif
         std::optional<std::filesystem::path> cuobjdump =
             is_executable(cuobjdump_path) ? std::optional(cuobjdump_path) : std::nullopt;
         return {.nvcc = std::move(nvcc), .cuobjdump = std::move(cuobjdump)};

@@ -53,6 +53,12 @@ using TorchCUDAStreamGuard = deep_jit::cuda::TorchCUDAStreamGuard;
 using deep_jit::cuda::get_stream_from_pool;
 namespace fs = std::filesystem;
 
+#if defined(_WIN32)
+constexpr auto kPathListSeparator = ";";
+#else
+constexpr auto kPathListSeparator = ":";
+#endif
+
 deep_jit::LazyInit<Runtime> python_api_jit(nullptr);
 int python_api_num_initializations = 0;
 std::shared_ptr<Runtime> process_test_runtime;
@@ -136,11 +142,24 @@ void restore_env(const std::string& name, const std::optional<std::string>& valu
 
 void write_executable(const fs::path& path, const std::string& content) {
     deep_jit::write_file_sync(path, content);
+#if !defined(_WIN32)
     fs::permissions(
         path,
         fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec,
         fs::perm_options::add);
+#endif
 }
+
+#if defined(_WIN32)
+void write_windows_compiler(const fs::path& path, const std::string& mode, const fs::path& compiler = {}) {
+    const auto python = deep_jit::get_env<std::string>("DEEP_JIT_TEST_PYTHON");
+    DJ_HOST_ASSERT(not python.empty(), "DEEP_JIT_TEST_PYTHON must be set");
+    const auto script = get_test_cuda_project_dir() / "scripts/windows_compiler.py";
+    write_executable(path, std::format(
+        "@echo off\r\n\"{}\" \"{}\" \"{}\" \"{}\" %*\r\nexit /b %errorlevel%\r\n",
+        python, script.string(), mode, compiler.string()));
+}
+#endif
 
 std::string get_source(const std::string& name) {
     return deep_jit::read(get_test_cuda_project_dir() / "kernels" / name);
@@ -281,7 +300,13 @@ void test_environment(const fs::path& cache_root) {
     expect_failure([&] { env.get<int>("INVALID_INTEGER"); }, "invalid value");
     unset_env("TEST_ENV_INVALID_INTEGER");
     set_env("TEST_ENV_EMPTY_BOOL", "");
+#if defined(_WIN32)
+    DJ_HOST_ASSERT(not env.get<bool>("EMPTY_BOOL").has_value(),
+                   "the Windows CRT must remove an empty environment value");
+    expect_failure([] { deep_jit::parse_integer<long long>("", "EMPTY_BOOL"); }, "invalid value");
+#else
     expect_failure([&] { env.get<bool>("EMPTY_BOOL"); }, "invalid value");
+#endif
     unset_env("TEST_ENV_EMPTY_BOOL");
     set_env("TEST_ENV_UNSIGNED", "-1");
     expect_failure([&] { env.get<unsigned>("UNSIGNED"); }, "invalid value");
@@ -295,7 +320,7 @@ void test_environment(const fs::path& cache_root) {
 
     const auto first_cache = cache_root / "first";
     const auto second_cache = cache_root / "second";
-    set_env("TEST_ENV_JIT_CACHE_DIR", first_cache.string() + ":" + second_cache.string());
+    set_env("TEST_ENV_JIT_CACHE_DIR", first_cache.string() + kPathListSeparator + second_cache.string());
     const auto disk_cache = deep_jit::DiskCache::from_env(env);
     DJ_HOST_ASSERT(disk_cache.paths.size() == 2);
     DJ_HOST_ASSERT(disk_cache.paths[0] == first_cache);
@@ -303,10 +328,16 @@ void test_environment(const fs::path& cache_root) {
     unset_env("TEST_ENV_JIT_CACHE_DIR");
 
     for (const auto& invalid_cache_paths : std::vector<std::string>{
+#if !defined(_WIN32)
              "",
-             ":" + first_cache.string(),
-             first_cache.string() + ":",
+#endif
+             kPathListSeparator + first_cache.string(),
+             first_cache.string() + kPathListSeparator,
+#if defined(_WIN32)
+             first_cache.string() + ";;" + second_cache.string(),
+#else
              first_cache.string() + "::" + second_cache.string(),
+#endif
          }) {
         set_env("TEST_ENV_JIT_CACHE_DIR", invalid_cache_paths);
         expect_failure([&] { deep_jit::DiskCache::from_env(env); }, "contains an empty path");
@@ -315,7 +346,14 @@ void test_environment(const fs::path& cache_root) {
 
     const auto saved_home = get_raw_env("HOME");
     const auto saved_global_cache = get_raw_env("DJ_JIT_CACHE_DIR");
+#if defined(_WIN32)
+    const auto saved_userprofile = get_raw_env("USERPROFILE");
+    DJ_HOST_ASSERT((saved_home or saved_userprofile) and saved_global_cache.has_value());
+    const auto default_home = saved_home.value_or(saved_userprofile.value_or(""));
+#else
     DJ_HOST_ASSERT(saved_home.has_value() and saved_global_cache.has_value());
+    const auto& default_home = *saved_home;
+#endif
     DJ_HOST_ASSERT(deep_jit::DiskCache::from_env(env).paths ==
                        std::vector<fs::path>{fs::path(*saved_global_cache)},
                    "DJ cache directory was not used as the global fallback");
@@ -326,10 +364,19 @@ void test_environment(const fs::path& cache_root) {
     unset_env("JIT_CACHE_DIR");
     unset_env("DJ_JIT_CACHE_DIR");
     DJ_HOST_ASSERT(deep_jit::DiskCache::from_env(env).paths ==
-                   std::vector<fs::path>{fs::path(*saved_home) / ".dj"});
+                   std::vector<fs::path>{fs::path(default_home) / ".dj"});
     unset_env("HOME");
+#if defined(_WIN32)
+    if (saved_userprofile)
+        DJ_HOST_ASSERT(deep_jit::DiskCache::from_env(env).paths ==
+                       std::vector<fs::path>{fs::path(*saved_userprofile) / ".dj"});
+    unset_env("USERPROFILE");
+#endif
     expect_failure([&] { deep_jit::DiskCache::from_env(env); }, "HOME environment variable must not be empty");
     restore_env("HOME", saved_home);
+#if defined(_WIN32)
+    restore_env("USERPROFILE", saved_userprofile);
+#endif
     restore_env("DJ_JIT_CACHE_DIR", saved_global_cache);
 }
 
@@ -387,7 +434,12 @@ void test_filesystem(const fs::path& cache_root) {
     DJ_HOST_ASSERT(not deep_jit::normalize_path(fs::path{}).has_value());
     DJ_HOST_ASSERT(deep_jit::normalize_path(fs::path("relative/../normalized")) ==
                    fs::absolute("normalized").lexically_normal());
+#if defined(_WIN32)
+    DJ_HOST_ASSERT(deep_jit::is_executable(deep_jit::get_env<std::string>("DEEP_JIT_TEST_PYTHON")));
+    DJ_HOST_ASSERT(not deep_jit::is_executable(cache_root), "a directory is not an executable file");
+#else
     DJ_HOST_ASSERT(deep_jit::is_executable("/bin/sh"));
+#endif
 
     const auto remove_root = cache_root / "safe_remove_all";
     deep_jit::make_dirs(remove_root / "nested");
@@ -397,7 +449,12 @@ void test_filesystem(const fs::path& cache_root) {
 
     const auto single_file = cache_root / "single_file";
     deep_jit::write_file_sync(single_file, "payload");
+#if defined(_WIN32)
+    DJ_HOST_ASSERT(deep_jit::is_executable(single_file),
+                   "the Windows CRT precheck accepts readable regular files");
+#else
     DJ_HOST_ASSERT(not deep_jit::is_executable(single_file), "regular data file was reported as executable");
+#endif
     deep_jit::safe_remove_all(single_file);
     DJ_HOST_ASSERT(not fs::exists(single_file), "safe_remove_all did not remove a single file");
     DJ_HOST_ASSERT(not deep_jit::try_update_mtime(single_file), "mtime update unexpectedly succeeded for a missing file");
@@ -405,6 +462,22 @@ void test_filesystem(const fs::path& cache_root) {
 }
 
 void test_command_and_uuid() {
+#if defined(_WIN32)
+    const auto python = std::format("\"{}\" -c ", deep_jit::get_env<std::string>("DEEP_JIT_TEST_PYTHON"));
+    DJ_HOST_ASSERT(deep_jit::call_external_command(
+        python + "\"import sys; sys.stdout.write('stdout'); sys.stdout.flush(); sys.stderr.write('stderr')\"") == "stdoutstderr",
+        "external command did not capture stdout and stderr");
+    DJ_HOST_ASSERT(deep_jit::call_external_command(
+        python + "\"import sys; sys.stdout.write('0' * 1024)\"").size() == 1024,
+        "external command output was truncated");
+    expect_failure([] { deep_jit::call_external_command(""); }, "command must not be empty");
+    expect_failure([&] {
+        deep_jit::call_external_command(python + "\"import sys; sys.stdout.write('failure'); sys.exit(7)\"");
+    }, "command failed with exit code 7");
+    expect_failure([&] {
+        deep_jit::call_external_command(python + "\"import os; os._exit(-1073741510)\"");
+    }, "exit code -1073741510");
+#else
     DJ_HOST_ASSERT(deep_jit::call_external_command("sh -c 'printf stdout; printf stderr >&2'") == "stdoutstderr",
                    "external command did not capture stdout and stderr");
     DJ_HOST_ASSERT(deep_jit::call_external_command("printf '%01024d' 0").size() == 1024,
@@ -413,6 +486,7 @@ void test_command_and_uuid() {
     expect_failure([] { deep_jit::call_external_command("sh -c 'printf failure; exit 7'"); },
                    "command failed with exit code 7");
     expect_failure([] { deep_jit::call_external_command("kill -TERM $$"); }, "exit code 143");
+#endif
 
 #if defined(_WIN32)
     const auto prefix = std::to_string(::_getpid()) + "-";
@@ -962,11 +1036,19 @@ void test_options(Runtime& runtime) {
     const std::vector<std::string> expected_default_flags = {
         "--gpu-architecture=sm_" + *defaults.arch,
         "-O3",
+#if defined(_WIN32)
+        "--compiler-options=/O2",
+#else
         "--compiler-options=-O3",
+#endif
         "--ptxas-options=--register-usage-level=10",
         "-std=c++20",
+#if defined(_WIN32)
+        "--compiler-options=/MD,/Zc:preprocessor,/Zc:__cplusplus",
+#else
         "--compiler-options=-fPIC",
         "--compiler-options=-fconcepts",
+#endif
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
     };
@@ -1063,15 +1145,23 @@ void test_options(Runtime& runtime) {
         return std::ranges::find(flags, expected) != flags.end();
     };
     DJ_HOST_ASSERT(has_flag("-O0"));
+#if defined(_WIN32)
+    DJ_HOST_ASSERT(has_flag("--compiler-options=/Od"));
+#else
     DJ_HOST_ASSERT(has_flag("--compiler-options=-O0"));
+#endif
     DJ_HOST_ASSERT(has_flag("--use_fast_math"));
     DJ_HOST_ASSERT(has_flag("--ptxas-options=--register-usage-level=10"));
     DJ_HOST_ASSERT(has_flag("--ptxas-options=--warn-on-spills"));
     DJ_HOST_ASSERT(has_flag("--ptxas-options=--warn-on-local-memory-usage"));
     DJ_HOST_ASSERT(has_flag("--generate-line-info"));
     DJ_HOST_ASSERT(has_flag("-std=c++20"));
+#if defined(_WIN32)
+    DJ_HOST_ASSERT(has_flag("--compiler-options=/MD,/Zc:preprocessor,/Zc:__cplusplus"));
+#else
     DJ_HOST_ASSERT(has_flag("--compiler-options=-fPIC"));
     DJ_HOST_ASSERT(has_flag("--compiler-options=-fconcepts"));
+#endif
     DJ_HOST_ASSERT(has_flag("--expt-relaxed-constexpr"));
     DJ_HOST_ASSERT(has_flag("--expt-extended-lambda"));
     DJ_HOST_ASSERT(has_flag("-DTEST_OPTION=17"));
@@ -1082,8 +1172,13 @@ void test_options(Runtime& runtime) {
     };
     const auto replacement_flags = defaults.override_with(replacement).get_flags();
     DJ_HOST_ASSERT(std::ranges::find(replacement_flags, "-DREPLACED_FLAGS=1") != replacement_flags.end());
+#if defined(_WIN32)
+    DJ_HOST_ASSERT(std::ranges::find(replacement_flags, "--compiler-options=/MD,/Zc:preprocessor,/Zc:__cplusplus") == replacement_flags.end(),
+                   "nvcc_flags must replace the default free-form flags");
+#else
     DJ_HOST_ASSERT(std::ranges::find(replacement_flags, "--compiler-options=-fPIC") == replacement_flags.end(),
                    "nvcc_flags must replace the default free-form flags");
+#endif
 
     auto defaults_with_extra = defaults;
     defaults_with_extra.extra_nvcc_flags = {"-DDEFAULT_EXTRA=1"};
@@ -1100,7 +1195,11 @@ void test_options(Runtime& runtime) {
     });
     const auto size_flags = size_options.get_flags();
     DJ_HOST_ASSERT(std::ranges::find(size_flags, "-Os") != size_flags.end());
+#if defined(_WIN32)
+    DJ_HOST_ASSERT(std::ranges::find(size_flags, "--compiler-options=/Os") != size_flags.end());
+#else
     DJ_HOST_ASSERT(std::ranges::find(size_flags, "--compiler-options=-Os") != size_flags.end());
+#endif
     DJ_HOST_ASSERT(std::ranges::find(size_flags, "--ptxas-options=--register-usage-level=0") != size_flags.end());
 
     auto hook_defaults = defaults;
@@ -1226,9 +1325,17 @@ void test_library_environment_compatibility(Runtime& runtime, const fs::path& ca
 
     const auto compiler_override_dir = cache_root / "compiler_override";
     const auto compiler_override_cache = compiler_override_dir / "cache_root";
+#if defined(_WIN32)
+    const auto compiler_override = compiler_override_dir / "valid_nvcc.cmd";
+#else
     const auto compiler_override = compiler_override_dir / "valid_nvcc";
+#endif
     deep_jit::make_dirs(compiler_override_dir);
+#if defined(_WIN32)
+    write_windows_compiler(compiler_override, "version");
+#else
     write_executable(compiler_override, "#!/bin/sh\nprintf '%s\\n' 'Cuda compilation tools, release 13.1, V13.1.0'\n");
+#endif
     set_env("COMPILER_OVERRIDE_JIT_CACHE_DIR", compiler_override_cache.string());
     set_env("COMPILER_OVERRIDE_JIT_NVCC_COMPILER", compiler_override.string());
     const auto override_runtime = make_runtime_with_prefix(
@@ -1241,15 +1348,25 @@ void test_library_environment_compatibility(Runtime& runtime, const fs::path& ca
         [&] { make_runtime_with_prefix("INVALID_COMPILER", get_test_cuda_project_dir() / "include_original"); },
         "NVCC compiler is not executable");
 
+#if defined(_WIN32)
+    const auto malformed_compiler = compiler_override_dir / "malformed_nvcc.cmd";
+    write_windows_compiler(malformed_compiler, "bad_version");
+#else
     const auto malformed_compiler = compiler_override_dir / "malformed_nvcc";
     write_executable(malformed_compiler, "#!/bin/sh\nprintf '%s\\n' 'not an NVCC version'\n");
+#endif
     set_env("MALFORMED_COMPILER_JIT_NVCC_COMPILER", malformed_compiler.string());
     expect_failure(
         [&] { make_runtime_with_prefix("MALFORMED_COMPILER", get_test_cuda_project_dir() / "include_original"); },
         "failed to parse NVCC version");
 
+#if defined(_WIN32)
+    const auto old_compiler = compiler_override_dir / "old_nvcc.cmd";
+    write_windows_compiler(old_compiler, "old_version");
+#else
     const auto old_compiler = compiler_override_dir / "old_nvcc";
     write_executable(old_compiler, "#!/bin/sh\nprintf '%s\\n' 'Cuda compilation tools, release 12.8, V12.8.0'\n");
+#endif
     set_env("OLD_COMPILER_JIT_NVCC_COMPILER", old_compiler.string());
     expect_failure(
         [&] { make_runtime_with_prefix("OLD_COMPILER", get_test_cuda_project_dir() / "include_original"); },
@@ -1292,34 +1409,47 @@ void test_cuda_toolkit_discovery(const fs::path& cache_root) {
     const auto toolkit_b = cache_root / "toolkit_b";
     deep_jit::make_dirs(toolkit_a / "bin");
     deep_jit::make_dirs(toolkit_b / "bin");
+#if defined(_WIN32)
+    constexpr auto nvcc_name = "bin/nvcc.exe";
+    const auto python = deep_jit::get_env<std::string>("DEEP_JIT_TEST_PYTHON");
+    fs::copy_file(python, toolkit_a / nvcc_name);
+    fs::copy_file(python, toolkit_b / nvcc_name);
+#else
+    constexpr auto nvcc_name = "bin/nvcc";
     write_executable(toolkit_a / "bin/nvcc", "#!/bin/sh\nexit 0\n");
     write_executable(toolkit_b / "bin/nvcc", "#!/bin/sh\nexit 0\n");
+#endif
 
     const deep_jit::Env env("TOOLKIT_DISCOVERY");
     set_env("CUDA_HOME", toolkit_a.string());
     set_env("CUDA_PATH", toolkit_b.string());
-    DJ_HOST_ASSERT(deep_jit::CUDA::find_cuda_toolkit(env).nvcc == toolkit_a / "bin/nvcc",
+    DJ_HOST_ASSERT(deep_jit::CUDA::find_cuda_toolkit(env).nvcc == toolkit_a / nvcc_name,
                    "CUDA_HOME must take priority over CUDA_PATH");
 
-    set_env("DJ_JIT_NVCC_COMPILER", (toolkit_b / "bin/nvcc").string());
-    DJ_HOST_ASSERT(deep_jit::CUDA::find_cuda_toolkit(env).nvcc == toolkit_b / "bin/nvcc",
+    set_env("DJ_JIT_NVCC_COMPILER", (toolkit_b / nvcc_name).string());
+    DJ_HOST_ASSERT(deep_jit::CUDA::find_cuda_toolkit(env).nvcc == toolkit_b / nvcc_name,
                    "DJ NVCC override was not used as the global fallback");
-    set_env("TOOLKIT_DISCOVERY_JIT_NVCC_COMPILER", (toolkit_a / "bin/nvcc").string());
-    DJ_HOST_ASSERT(deep_jit::CUDA::find_cuda_toolkit(env).nvcc == toolkit_a / "bin/nvcc",
+    set_env("TOOLKIT_DISCOVERY_JIT_NVCC_COMPILER", (toolkit_a / nvcc_name).string());
+    DJ_HOST_ASSERT(deep_jit::CUDA::find_cuda_toolkit(env).nvcc == toolkit_a / nvcc_name,
                    "library NVCC override did not take priority over the DJ fallback");
     unset_env("TOOLKIT_DISCOVERY_JIT_NVCC_COMPILER");
     unset_env("DJ_JIT_NVCC_COMPILER");
-    set_env("JIT_NVCC_COMPILER", (toolkit_b / "bin/nvcc").string());
-    DJ_HOST_ASSERT(deep_jit::CUDA::find_cuda_toolkit(env).nvcc == toolkit_a / "bin/nvcc",
+    set_env("JIT_NVCC_COMPILER", (toolkit_b / nvcc_name).string());
+    DJ_HOST_ASSERT(deep_jit::CUDA::find_cuda_toolkit(env).nvcc == toolkit_a / nvcc_name,
                    "unprefixed NVCC override unexpectedly took effect");
     unset_env("JIT_NVCC_COMPILER");
 
     set_env("CUDA_HOME", "");
-    DJ_HOST_ASSERT(deep_jit::CUDA::find_cuda_toolkit(env).nvcc == toolkit_b / "bin/nvcc",
+    DJ_HOST_ASSERT(deep_jit::CUDA::find_cuda_toolkit(env).nvcc == toolkit_b / nvcc_name,
                    "CUDA_PATH was not used when CUDA_HOME was empty");
 
     unset_env("CUDA_HOME");
     unset_env("CUDA_PATH");
+#if defined(_WIN32)
+    set_env("PATH", (toolkit_a / "bin").string() + ";" + *saved_path);
+    DJ_HOST_ASSERT(deep_jit::CUDA::find_cuda_toolkit(env).nvcc == toolkit_a / nvcc_name,
+                   "where.exe discovery did not select the PATH compiler");
+#else
     set_env("PATH", (toolkit_a / "bin").string() + ":/usr/bin:/bin");
     DJ_HOST_ASSERT(deep_jit::CUDA::find_cuda_toolkit(env).nvcc == toolkit_a / "bin/nvcc",
                    "which nvcc discovery did not select the PATH compiler");
@@ -1331,6 +1461,7 @@ void test_cuda_toolkit_discovery(const fs::path& cache_root) {
         DJ_HOST_ASSERT(deep_jit::CUDA::find_cuda_toolkit(env).nvcc == "/usr/local/cuda/bin/nvcc",
                        "/usr/local/cuda fallback was not used after which nvcc failed");
     }
+#endif
 
     set_env("CUDA_HOME", (cache_root / "missing_cuda_home").string());
     expect_failure([&] { deep_jit::CUDA::find_cuda_toolkit(env); }, "not home_path.empty()");
@@ -1435,8 +1566,13 @@ void test_consumer_default_compiler_flags(const fs::path& cache_root) {
 
     auto& nvcc_flags = *runtime->default_compiler_options.nvcc_flags;
     nvcc_flags.emplace_back("--diag-suppress=39,161,174,177,186,940,3012");
+#if defined(_WIN32)
+    nvcc_flags.emplace_back("--compiler-options=/wd4996");
+    nvcc_flags.emplace_back("-I\"" + include_dir.string() + "\"");
+#else
     nvcc_flags.emplace_back("--compiler-options=-Wno-deprecated-declarations,-Wno-abi");
     nvcc_flags.emplace_back("-I" + include_dir.string());
+#endif
     nvcc_flags.emplace_back("-DEP_NUM_TOPK_IDX_BITS=64");
     nvcc_flags.emplace_back("-DTEST_OPTION=64");
     DJ_HOST_ASSERT(runtime->cache_key(source, runtime->default_compiler_options) != original_key,
@@ -1446,13 +1582,23 @@ void test_consumer_default_compiler_flags(const fs::path& cache_root) {
     const auto metadata = deep_jit::read(artifact / "meta.json");
     const std::vector<std::string> expected_flags = {
         "--diag-suppress=39,161,174,177,186,940,3012",
+#if defined(_WIN32)
+        "--compiler-options=/wd4996",
+        "-I\"" + include_dir.string() + "\"",
+#else
         "--compiler-options=-Wno-deprecated-declarations,-Wno-abi",
         "-I" + include_dir.string(),
+#endif
         "-DEP_NUM_TOPK_IDX_BITS=64",
     };
     for (const auto& expected : expected_flags) {
+#if defined(_WIN32)
+        DJ_HOST_ASSERT(metadata.find(deep_jit::json(expected).dump()) != std::string::npos,
+                       "consumer compiler flag is missing from metadata: {}", expected);
+#else
         DJ_HOST_ASSERT(metadata.find(expected) != std::string::npos,
                        "consumer compiler flag is missing from metadata: {}", expected);
+#endif
     }
     DJ_HOST_ASSERT(launch_value(*runtime, runtime->compile("consumer_defaults", source)) == 64,
                    "consumer default macro was not compiled");
@@ -1498,7 +1644,11 @@ void test_untracked_dependency_include_flags(const fs::path& cache_root) {
 
     const auto make_options = [&](const fs::path& dependency_dir) {
         auto options = runtime->default_compiler_options;
+#if defined(_WIN32)
+        options.nvcc_flags->emplace_back("-I\"" + dependency_dir.string() + "\"");
+#else
         options.nvcc_flags->emplace_back("-I" + dependency_dir.string());
+#endif
         return options;
     };
     const auto original_options = make_options(dependency_original);
@@ -2558,12 +2708,20 @@ void test_secondary_disk_cache(const fs::path& cache_root) {
     unset_env("SECONDARY_SOURCE_JIT_CACHE_DIR");
 
     const auto commit_path = expected_artifact / deep_jit::kCommitFileName;
+#if defined(_WIN32)
+    const auto windows_helper = get_test_cuda_project_dir().parent_path() / "_windows_test_utils.py";
+    deep_jit::call_external_command(std::format(
+        "\"{}\" \"{}\" --readonly-marker \"{}\"",
+        deep_jit::get_env<std::string>("DEEP_JIT_TEST_PYTHON"),
+        windows_helper.string(), commit_path.string()));
+#else
     DJ_HOST_ASSERT(fs::remove(commit_path));
     fs::create_symlink("/proc/version", commit_path);
+#endif
     DJ_HOST_ASSERT(not deep_jit::try_update_mtime(commit_path),
                    "read-only secondary cache marker unexpectedly allowed an mtime update");
 
-    set_env("SECONDARY_LOOKUP_JIT_CACHE_DIR", primary_cache.string() + ":" + secondary_cache.string());
+    set_env("SECONDARY_LOOKUP_JIT_CACHE_DIR", primary_cache.string() + kPathListSeparator + secondary_cache.string());
     const auto runtime = make_runtime_with_prefix(
         "SECONDARY_LOOKUP", include_dir);
     const auto artifact = runtime->compile_without_load("template_add", source);
@@ -2788,7 +2946,11 @@ void test_relocated_wheel_include_dir(const fs::path& cache_root) {
     const auto first_artifact = environment_a->compile_without_load("wheel_include_relocation", source);
     check_artifact(first_artifact, source);
     const auto first_metadata = deep_jit::read(first_artifact / "meta.json");
+#if defined(_WIN32)
+    DJ_HOST_ASSERT(first_metadata.find(deep_jit::json(environment_a_include.string()).dump()) != std::string::npos);
+#else
     DJ_HOST_ASSERT(first_metadata.find(environment_a_include.string()) != std::string::npos);
+#endif
 
     const auto environment_b = make_environment_runtime(environment_b_include);
     DJ_HOST_ASSERT(environment_a->cache_key(source, environment_a->default_compiler_options) ==
@@ -3001,9 +3163,16 @@ void test_dump_options_on_cache_hit(const fs::path& cache_root) {
 
 void test_ptxas_checks(const fs::path& cache_root) {
     const auto include_dir = get_test_cuda_project_dir() / "include_original";
+#if defined(_WIN32)
+    const auto compiler_path = cache_root / "ptxas_checks/nvcc.cmd";
+#else
     const auto compiler_path = cache_root / "ptxas_checks/nvcc";
+#endif
     const auto ptxas_cache = cache_root / "ptxas_checks/cache_root";
     deep_jit::make_dirs(compiler_path.parent_path());
+#if defined(_WIN32)
+    write_windows_compiler(compiler_path, "ptxas");
+#else
     write_executable(
         compiler_path,
         "#!/bin/sh\n"
@@ -3020,6 +3189,7 @@ void test_ptxas_checks(const fs::path& cache_root) {
         "  previous=\"$argument\"\n"
         "done\n"
         "printf '%s\\n' \"$DEEP_JIT_TEST_PTXAS_OUTPUT\"\n");
+#endif
     set_env("PTXAS_CHECK_JIT_CACHE_DIR", ptxas_cache.string());
     set_env("PTXAS_CHECK_JIT_NVCC_COMPILER", compiler_path.string());
     const auto ptxas_runtime = make_runtime_with_prefix("PTXAS_CHECK", include_dir);
@@ -3075,6 +3245,10 @@ void test_backend_output_validation(Runtime& runtime, const fs::path& cache_root
     const auto tool_dir = cache_root / "fake_compiler_tools";
     deep_jit::make_dirs(tool_dir);
 
+#if defined(_WIN32)
+    const auto failing_after_cubin_nvcc = tool_dir / "nvcc_failing_after_cubin.cmd";
+    write_windows_compiler(failing_after_cubin_nvcc, "partial_cubin");
+#else
     const auto failing_after_cubin_nvcc = tool_dir / "nvcc_failing_after_cubin";
     write_executable(
         failing_after_cubin_nvcc,
@@ -3092,6 +3266,7 @@ void test_backend_output_validation(Runtime& runtime, const fs::path& cache_root
         "  previous=\"$argument\"\n"
         "done\n"
         "exit 37\n");
+#endif
     const auto failing_after_cubin_cache = cache_root / "failing_after_cubin";
     set_env("FAILING_AFTER_CUBIN_JIT_CACHE_DIR", failing_after_cubin_cache.string());
     set_env("FAILING_AFTER_CUBIN_JIT_NVCC_COMPILER", failing_after_cubin_nvcc.string());
@@ -3102,9 +3277,13 @@ void test_backend_output_validation(Runtime& runtime, const fs::path& cache_root
     DJ_HOST_ASSERT(not fs::exists(failing_after_cubin_cache / "cache"),
                    "failed compiler output published a cache artifact");
     check_tmp_is_empty(failing_after_cubin_cache);
+#if defined(_WIN32)
+    write_windows_compiler(failing_after_cubin_nvcc, "passthrough", runtime.backend.toolkit.nvcc);
+#else
     write_executable(
         failing_after_cubin_nvcc,
         std::format("#!/bin/sh\nexec {} \"$@\"\n", runtime.backend.toolkit.nvcc.string()));
+#endif
     DJ_HOST_ASSERT(launch_value(
         *failing_after_cubin_runtime,
         failing_after_cubin_runtime->compile("failed_after_cubin", source), 1) == 95,
@@ -3112,6 +3291,10 @@ void test_backend_output_validation(Runtime& runtime, const fs::path& cache_root
     unset_env("FAILING_AFTER_CUBIN_JIT_CACHE_DIR");
     unset_env("FAILING_AFTER_CUBIN_JIT_NVCC_COMPILER");
 
+#if defined(_WIN32)
+    const auto no_cubin_nvcc = tool_dir / "nvcc_without_cubin.cmd";
+    write_windows_compiler(no_cubin_nvcc, "no_cubin");
+#else
     const auto no_cubin_nvcc = tool_dir / "nvcc_without_cubin";
     write_executable(
         no_cubin_nvcc,
@@ -3120,6 +3303,7 @@ void test_backend_output_validation(Runtime& runtime, const fs::path& cache_root
         "  printf '%s\\n' 'Cuda compilation tools, release 13.1, V13.1.0'\n"
         "fi\n"
         "exit 0\n");
+#endif
     const auto no_cubin_cache = cache_root / "no_cubin";
     set_env("NO_CUBIN_JIT_CACHE_DIR", no_cubin_cache.string());
     set_env("NO_CUBIN_JIT_NVCC_COMPILER", no_cubin_nvcc.string());
@@ -3130,6 +3314,9 @@ void test_backend_output_validation(Runtime& runtime, const fs::path& cache_root
     DJ_HOST_ASSERT(not fs::exists(no_cubin_cache / "cache"),
                    "missing CUBIN output published a cache artifact");
     check_tmp_is_empty(no_cubin_cache);
+#if defined(_WIN32)
+    write_windows_compiler(no_cubin_nvcc, "empty_cubin");
+#else
     write_executable(
         no_cubin_nvcc,
         "#!/bin/sh\n"
@@ -3142,15 +3329,20 @@ void test_backend_output_validation(Runtime& runtime, const fs::path& cache_root
         "  previous=\"$argument\"\n"
         "done\n"
         "exit 0\n");
+#endif
     expect_failure(
         [&] { no_cubin_runtime->compile_without_load("missing_cubin_output", source); },
         "NVCC did not produce a valid CUBIN");
     DJ_HOST_ASSERT(not fs::exists(no_cubin_cache / "cache"),
                    "empty CUBIN output published a cache artifact");
     check_tmp_is_empty(no_cubin_cache);
+#if defined(_WIN32)
+    write_windows_compiler(no_cubin_nvcc, "passthrough", runtime.backend.toolkit.nvcc);
+#else
     write_executable(
         no_cubin_nvcc,
         std::format("#!/bin/sh\nexec {} \"$@\"\n", runtime.backend.toolkit.nvcc.string()));
+#endif
     DJ_HOST_ASSERT(launch_value(
         *no_cubin_runtime,
         no_cubin_runtime->compile("missing_cubin_output", source), 1) == 95,
@@ -3158,6 +3350,10 @@ void test_backend_output_validation(Runtime& runtime, const fs::path& cache_root
     unset_env("NO_CUBIN_JIT_CACHE_DIR");
     unset_env("NO_CUBIN_JIT_NVCC_COMPILER");
 
+#if defined(_WIN32)
+    const auto no_ptx_nvcc = tool_dir / "nvcc_without_ptx.cmd";
+    write_windows_compiler(no_ptx_nvcc, "no_ptx", runtime.backend.toolkit.nvcc);
+#else
     const auto no_ptx_nvcc = tool_dir / "nvcc_without_ptx";
     write_executable(
         no_ptx_nvcc,
@@ -3174,6 +3370,7 @@ void test_backend_output_validation(Runtime& runtime, const fs::path& cache_root
             "exec {} \"$@\"\n",
             runtime.backend.toolkit.nvcc.string(),
             runtime.backend.toolkit.nvcc.string()));
+#endif
     const auto no_ptx_cache = cache_root / "no_ptx";
     set_env("NO_PTX_JIT_CACHE_DIR", no_ptx_cache.string());
     set_env("NO_PTX_JIT_NVCC_COMPILER", no_ptx_nvcc.string());
@@ -3187,6 +3384,9 @@ void test_backend_output_validation(Runtime& runtime, const fs::path& cache_root
     DJ_HOST_ASSERT(not fs::exists(no_ptx_cache / "cache"),
                    "missing PTX output published a cache artifact");
     check_tmp_is_empty(no_ptx_cache);
+#if defined(_WIN32)
+    write_windows_compiler(no_ptx_nvcc, "empty_ptx", runtime.backend.toolkit.nvcc);
+#else
     write_executable(
         no_ptx_nvcc,
         std::format(
@@ -3209,6 +3409,7 @@ void test_backend_output_validation(Runtime& runtime, const fs::path& cache_root
             "exec {} \"$@\"\n",
             runtime.backend.toolkit.nvcc.string(),
             runtime.backend.toolkit.nvcc.string()));
+#endif
     expect_failure(
         [&] {
             no_ptx_runtime->compile_without_load(
@@ -3218,9 +3419,13 @@ void test_backend_output_validation(Runtime& runtime, const fs::path& cache_root
     DJ_HOST_ASSERT(not fs::exists(no_ptx_cache / "cache"),
                    "empty PTX output published a cache artifact");
     check_tmp_is_empty(no_ptx_cache);
+#if defined(_WIN32)
+    write_windows_compiler(no_ptx_nvcc, "passthrough", runtime.backend.toolkit.nvcc);
+#else
     write_executable(
         no_ptx_nvcc,
         std::format("#!/bin/sh\nexec {} \"$@\"\n", runtime.backend.toolkit.nvcc.string()));
+#endif
     const auto recovered_ptx_artifact = no_ptx_runtime->compile_without_load(
         "missing_ptx_output", source, CompilerOptions {.dump_ptx = true});
     DJ_HOST_ASSERT(fs::file_size(recovered_ptx_artifact / "kernel.ptx") > 0,
@@ -3265,8 +3470,13 @@ void test_backend_output_validation(Runtime& runtime, const fs::path& cache_root
     if (not runtime.backend.toolkit.cuobjdump)
         return;
 
+#if defined(_WIN32)
+    const auto empty_cuobjdump = tool_dir / "empty_cuobjdump.cmd";
+    write_windows_compiler(empty_cuobjdump, "no_output");
+#else
     const auto empty_cuobjdump = tool_dir / "empty_cuobjdump";
     write_executable(empty_cuobjdump, "#!/bin/sh\nexit 0\n");
+#endif
     const auto empty_sass_cache = cache_root / "empty_sass";
     set_env("EMPTY_SASS_JIT_CACHE_DIR", empty_sass_cache.string());
     const auto empty_sass_runtime = make_runtime_with_prefix("EMPTY_SASS", include_dir);
@@ -3280,9 +3490,13 @@ void test_backend_output_validation(Runtime& runtime, const fs::path& cache_root
     DJ_HOST_ASSERT(not fs::exists(empty_sass_cache / "cache"),
                    "empty SASS output published a cache artifact");
     check_tmp_is_empty(empty_sass_cache);
+#if defined(_WIN32)
+    write_windows_compiler(empty_cuobjdump, "passthrough", *runtime.backend.toolkit.cuobjdump);
+#else
     write_executable(
         empty_cuobjdump,
         std::format("#!/bin/sh\nexec {} \"$@\"\n", runtime.backend.toolkit.cuobjdump->string()));
+#endif
     const auto recovered_sass_artifact = empty_sass_runtime->compile_without_load(
         "empty_sass_output", source, CompilerOptions {.dump_sass = true});
     DJ_HOST_ASSERT(fs::file_size(recovered_sass_artifact / "kernel.sass") > 0,

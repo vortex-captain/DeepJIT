@@ -21,6 +21,9 @@ from torch.utils.cpp_extension import (
     load,
 )
 
+if sys.platform == 'win32':
+    import _windows_test_utils as windows_test_utils
+
 
 if not __debug__:
     raise RuntimeError('DeepJIT tests require Python assertions to be enabled')
@@ -37,13 +40,25 @@ def register_process_group(process):
     return process
 
 
+def popen_process_group(*args, **kwargs):
+    if sys.platform == 'win32':
+        return windows_test_utils.popen(*args, **kwargs)
+    return subprocess.Popen(*args, **kwargs)
+
+
 def unregister_process_group(process):
+    if sys.platform == 'win32':
+        windows_test_utils.unregister_process(process)
     group_dir = os.environ.get('DEEP_JIT_TEST_CHILD_PROCESS_GROUP_DIR')
     if group_dir:
         (Path(group_dir) / str(process.pid)).unlink(missing_ok=True)
 
 
 def terminate_process_group(process):
+    if sys.platform == 'win32':
+        windows_test_utils.terminate_process(process)
+        unregister_process_group(process)
+        return
     group_dir = os.environ.get('DEEP_JIT_TEST_CHILD_PROCESS_GROUP_DIR')
     marker = Path(group_dir) / str(process.pid) if group_dir else None
     if marker is None or marker.exists():
@@ -63,6 +78,9 @@ def terminate_process_group(process):
 
 
 def terminate_registered_process_groups(group_dir):
+    if sys.platform == 'win32':
+        windows_test_utils.terminate_registered_processes()
+        return
     for marker in Path(group_dir).iterdir():
         try:
             os.killpg(int(marker.name), signal.SIGKILL)
@@ -145,6 +163,9 @@ else:
 
 
 def validate_fork_after_lazy_init(module_path, temporary_dir):
+    if sys.platform == 'win32':
+        print('SKIP fork-after-lazy-init: Windows has no fork', flush=True)
+        return
     code = '''
 import importlib.util
 import os
@@ -265,6 +286,17 @@ def validate_header_self_containment(temporary_dir):
     print(f'validated {len(headers)} self-contained CUDA/public headers', flush=True)
 
 
+def nvcc_barrier_command(directory):
+    script = TEST_CUDA_PROJECT / 'scripts' / 'nvcc_barrier.py'
+    if sys.platform != 'win32':
+        return str(script)
+    wrapper = directory / 'nvcc_barrier.cmd'
+    wrapper.write_text(
+        f'@echo off\n"{sys.executable}" "{script}" %*\n'
+        'exit /b %errorlevel%\n', encoding='utf-8')
+    return str(wrapper)
+
+
 def validate_compile_releases_gil(module, temporary_dir):
     cache_root = temporary_dir / 'gil_cache'
     compiler_barrier_dir = temporary_dir / 'gil_compiler_barrier'
@@ -272,8 +304,10 @@ def validate_compile_releases_gil(module, temporary_dir):
     compiler_barrier_dir.mkdir()
     environment = {
         'GIL_TEST_JIT_CACHE_DIR': str(cache_root),
-        'GIL_TEST_JIT_NVCC_COMPILER': str(TEST_CUDA_PROJECT / 'scripts' / 'nvcc_barrier.py'),
-        'DEEP_JIT_TEST_REAL_NVCC': str(Path(CUDA_HOME) / 'bin' / 'nvcc'),
+        'GIL_TEST_JIT_NVCC_COMPILER': nvcc_barrier_command(temporary_dir),
+        'DEEP_JIT_TEST_REAL_NVCC': str(
+            Path(CUDA_HOME) / 'bin' /
+            ('nvcc.exe' if sys.platform == 'win32' else 'nvcc')),
         'DEEP_JIT_TEST_NVCC_BARRIER_DIR': str(compiler_barrier_dir),
         'DEEP_JIT_TEST_NVCC_BARRIER_SIZE': '1',
         'DEEP_JIT_TEST_PYTHON_PROGRESS_PATH': str(python_progress_path),
@@ -425,8 +459,10 @@ def validate_multiprocess_cache(module_path, temporary_dir):
         env['PROCESS_TEST_JIT_DUMP_PTX'] = '0'
         env['PROCESS_TEST_JIT_DUMP_SASS'] = '0'
         env['PROCESS_TEST_JIT_CPP_STANDARD'] = '20'
-        env['PROCESS_TEST_JIT_NVCC_COMPILER'] = str(TEST_CUDA_PROJECT / 'scripts' / 'nvcc_barrier.py')
-        env['DEEP_JIT_TEST_REAL_NVCC'] = str(Path(CUDA_HOME) / 'bin' / 'nvcc')
+        env['PROCESS_TEST_JIT_NVCC_COMPILER'] = nvcc_barrier_command(coordination_dir)
+        env['DEEP_JIT_TEST_REAL_NVCC'] = str(
+            Path(CUDA_HOME) / 'bin' /
+            ('nvcc.exe' if sys.platform == 'win32' else 'nvcc'))
         env['DEEP_JIT_TEST_NVCC_BARRIER_DIR'] = str(compiler_barrier_dir)
         env['DEEP_JIT_TEST_NVCC_BARRIER_SIZE'] = str(len(cases))
         start_path = coordination_dir / 'start'
@@ -436,7 +472,7 @@ def validate_multiprocess_cache(module_path, temporary_dir):
             for index, (tag, bias) in enumerate(cases):
                 worker_env = env.copy()
                 worker_env['DEEP_JIT_TEST_WORKER_ID'] = str(index)
-                processes.append(register_process_group(subprocess.Popen(
+                processes.append(register_process_group(popen_process_group(
                     [
                         sys.executable,
                         str(TEST_CUDA_PROJECT / 'scripts' / 'compile_process.py'),
@@ -450,7 +486,10 @@ def validate_multiprocess_cache(module_path, temporary_dir):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
-                    start_new_session=True,
+                    start_new_session=sys.platform != 'win32',
+                    creationflags=(
+                        subprocess.CREATE_NEW_PROCESS_GROUP
+                        if sys.platform == 'win32' else 0),
                 )))
 
             deadline = time.monotonic() + 60
@@ -546,7 +585,7 @@ def validate_direct_disk_cache_publication(module_path, temporary_dir):
 
     try:
         for index in range(8):
-            processes.append(register_process_group(subprocess.Popen(
+            processes.append(register_process_group(popen_process_group(
                 [
                     sys.executable,
                     str(TEST_CUDA_PROJECT / 'scripts' / 'disk_cache_process.py'),
@@ -559,7 +598,10 @@ def validate_direct_disk_cache_publication(module_path, temporary_dir):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                start_new_session=True,
+                start_new_session=sys.platform != 'win32',
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP
+                    if sys.platform == 'win32' else 0),
             )))
 
         deadline = time.monotonic() + 60
@@ -610,12 +652,15 @@ def validate_crashed_disk_cache_writer(module_path, temporary_dir):
         str(ready_path),
         str(blocked_start_path),
     ]
-    crashed = register_process_group(subprocess.Popen(
+    crashed = register_process_group(popen_process_group(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        start_new_session=True,
+        start_new_session=sys.platform != 'win32',
+        creationflags=(
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            if sys.platform == 'win32' else 0),
     ))
     try:
         deadline = time.monotonic() + 60
@@ -745,7 +790,9 @@ def validate_artifacts(cache_root):
         assert metadata['command'], metadata
         assert metadata['config']['python_library_root'] == str(TEST_CUDA_PROJECT), metadata
         assert metadata['config']['include_prefixes'] == ['test_cuda/'], metadata
-        command = shlex.split(metadata['command'])
+        command = (
+            windows_test_utils.split_command(metadata['command'])
+            if sys.platform == 'win32' else shlex.split(metadata['command']))
         assert command[0] == metadata['compiler_info']['path'], metadata
         assert '--cubin' in command and '--output-file' in command, metadata
         assert sum(Path(argument).name == 'kernel.cu' for argument in command) == 1, metadata
@@ -770,6 +817,8 @@ def validate_artifacts(cache_root):
     assert compiler_options['extra_nvcc_flags'] == ['-DTEST_OPTION=17'], compiler_options
     command = compiler_options_metadata['command'].split()
     for flag in ('-O0', '--compiler-options=-O0', '--use_fast_math', '--generate-line-info', '-DTEST_OPTION=17'):
+        if sys.platform == 'win32' and flag == '--compiler-options=-O0':
+            flag = '--compiler-options=/Od'
         assert flag in command, compiler_options_metadata
 
     dump_artifact = next(artifact for artifact in artifacts if artifact.name.startswith('launch_overhead.'))
@@ -810,6 +859,8 @@ def run_worker():
 
         os.environ['PATH'] = str(bin_dir) + os.pathsep + os.environ.get('PATH', '')
         os.environ['DEEP_JIT_CUDA_TEST_SOURCE_DIR'] = str(TEST_CUDA_PROJECT)
+        if sys.platform == 'win32':
+            os.environ['DEEP_JIT_TEST_PYTHON'] = sys.executable
         os.environ['DEEP_JIT_CUDA_TEST_CACHE_ROOT'] = str(cache_root)
         os.environ['DJ_JIT_CACHE_DIR'] = str(temporary_dir / 'global_cache')
         os.environ['TEST_JIT_CACHE_DIR'] = str(cache_root)
@@ -880,28 +931,41 @@ def main():
         env = os.environ.copy()
         env['DEEP_JIT_TEST_DEVICE_COUNT'] = str(torch.cuda.device_count())
         env['DEEP_JIT_TEST_CHILD_PROCESS_GROUP_DIR'] = group_dir
-        process = subprocess.Popen(
+        process = popen_process_group(
             [sys.executable, str(Path(__file__).resolve()), '--worker'],
             env=env,
-            start_new_session=True,
+            start_new_session=sys.platform != 'win32',
+            creationflags=(
+                subprocess.CREATE_NEW_PROCESS_GROUP
+                if sys.platform == 'win32' else 0),
         )
+        if sys.platform == 'win32':
+            register_process_group(process)
         try:
             return_code = process.wait(timeout=1800)
         except BaseException:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if sys.platform == 'win32':
+                terminate_process_group(process)
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             process.wait()
             terminate_registered_process_groups(group_dir)
             raise
         if return_code != 0:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if sys.platform == 'win32':
+                terminate_process_group(process)
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             terminate_registered_process_groups(group_dir)
             raise subprocess.CalledProcessError(return_code, process.args)
+        if sys.platform == 'win32':
+            unregister_process_group(process)
         assert not any(Path(group_dir).iterdir()), 'child process-group registrations were not cleaned'
 
 

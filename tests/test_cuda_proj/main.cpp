@@ -2947,7 +2947,8 @@ void test_relocated_wheel_include_dir(const fs::path& cache_root) {
     check_artifact(first_artifact, source);
     const auto first_metadata = deep_jit::read(first_artifact / "meta.json");
 #if defined(_WIN32)
-    DJ_HOST_ASSERT(first_metadata.find(deep_jit::json(environment_a_include.string()).dump()) != std::string::npos);
+    DJ_HOST_ASSERT(first_metadata.find(
+                       deep_jit::json(environment_a_include.lexically_normal().string()).dump()) != std::string::npos);
 #else
     DJ_HOST_ASSERT(first_metadata.find(environment_a_include.string()) != std::string::npos);
 #endif

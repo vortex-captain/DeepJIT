@@ -7,8 +7,17 @@ from pathlib import Path
 
 
 nvcc = os.environ['DEEP_JIT_TEST_REAL_NVCC']
-if '--version' in sys.argv[1:]:
+
+
+def run_nvcc():
+    if sys.platform == 'win32':
+        import subprocess
+        raise SystemExit(subprocess.call([nvcc, *sys.argv[1:]]))
     os.execv(nvcc, [nvcc, *sys.argv[1:]])
+
+
+if '--version' in sys.argv[1:]:
+    run_nvcc()
 
 barrier_dir = Path(os.environ['DEEP_JIT_TEST_NVCC_BARRIER_DIR'])
 marker = barrier_dir / os.environ.get('DEEP_JIT_TEST_WORKER_ID', str(os.getpid()))
@@ -29,4 +38,4 @@ if progress_path := os.environ.get('DEEP_JIT_TEST_PYTHON_PROGRESS_PATH'):
         time.sleep(0.01)
 
 time.sleep(float(os.environ.get('DEEP_JIT_TEST_NVCC_DELAY_SECONDS', '0')))
-os.execv(nvcc, [nvcc, *sys.argv[1:]])
+run_nvcc()
